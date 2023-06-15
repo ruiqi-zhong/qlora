@@ -76,29 +76,40 @@ def get_tokenizer(args, model):
     return tokenizer
 
 
+def get_model_tokenizer_from_dir_step(model_dir, step):
+    arg_path = os.path.join(model_dir, f"args.pkl")
+    checkpoint_dir = os.path.join(model_dir, f"checkpoint-{step}/")
+    with open(arg_path, "rb") as f:
+        args = pkl.load(f)
+        model = get_accelerate_model(args, checkpoint_dir=checkpoint_dir)
+    tokenizer = get_tokenizer(args, model)
+    return model, tokenizer
+
+
 class InferenceWrapper:
     def __init__(
         self,
-        model_dir,
-        step,
+        model_tokenizer=None,
         template_path="/scratch/users/ruiqi-zhong/descriptive_clustering/templates/gpt_validator.txt",
+        model_dir=None,
+        step=None,
     ):
-        arg_path = os.path.join(model_dir, f"args.pkl")
-        checkpoint_dir = os.path.join(model_dir, f"checkpoint-{step}/")
-        with open(arg_path, "rb") as f:
-            args = pkl.load(f)
-
-        self.model = get_accelerate_model(args, checkpoint_dir=checkpoint_dir)
-        self.tokenizer = get_tokenizer(args, self.model)
+        if model_tokenizer is None:
+            self.model, self.tokenizer = get_model_tokenizer_from_dir_step(
+                model_dir, step
+            )
+        else:
+            self.model, self.tokenizer = model_tokenizer
+            assert model_dir is None and step is None
         with open(template_path, "r") as f:
             self.template = f.read()
         self.valid_responses = ["Yes", "No"]
 
         self.yes_no_idxes = [self.tokenizer.encode(r)[1] for r in self.valid_responses]
 
-    def validate(self, hypothesis_text_dicts, bsize=8, verbose=True):
+    def validate(self, hypothesis_text_dicts, batch_size=8, verbose=True):
         prompts = [self.template.format(**d) for d in hypothesis_text_dicts]
-        return self.get_yes_no(prompts, bsize, verbose=verbose)
+        return self.get_yes_no(prompts, batch_size, verbose=verbose)
 
     def get_yes_no_batch(self, prompts):
 
@@ -118,7 +129,7 @@ class InferenceWrapper:
 
         for i in range(len(prompts)):
             yes_no_logits = logits[0][i][self.yes_no_idxes].cpu().numpy()
-            results.append(yes_no_logits[0] > yes_no_logits[1])
+            results.append(bool(yes_no_logits[0] > yes_no_logits[1]))
         return results
 
     def get_yes_no(self, prompts, batch_size, verbose=True):
@@ -132,7 +143,7 @@ class InferenceWrapper:
             for b in batch_results:
                 yield b
 
-    def get_generation(self, prompts, max_new_tokens, temperature=1.0):
+    def get_generation_batch(self, prompts, max_new_tokens, temperature=1.0):
         inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(DEVICE)
         outputs = self.model.generate(
             **inputs,
@@ -152,22 +163,37 @@ class InferenceWrapper:
         ]
         return returned_strings
 
+    def get_generation(
+        self, prompts, max_new_tokens, temperature=1.0, batch_size=8, verbose=True
+    ):
+        pbar = (
+            trange(0, len(prompts), batch_size)
+            if verbose
+            else range(0, len(prompts), batch_size)
+        )
+        for i in pbar:
+            batch_results = self.get_generation_batch(
+                prompts[i : i + batch_size], max_new_tokens, temperature=temperature
+            )
+            for b in batch_results:
+                yield b
+
 
 if __name__ == "__main__":
     model_dir = "output/verifier/"
     step = 6000
 
-    validator = InferenceWrapper(model_dir, step)
+    lm_inference = InferenceWrapper(model_dir=model_dir, step=step)
     hypothesis_text_dicts = [
         {"hypothesis": "sounds happy", "text": "yeah!!!!"},
         {"hypothesis": "sounds happy", "text": "sh**t"},
         {"hypothesis": "sounds happy", "text": "f**k"},
     ] * 100
 
-    for b in validator.validate(hypothesis_text_dicts, verbose=False):
+    for b in lm_inference.validate(hypothesis_text_dicts, verbose=False):
         print(b)
 
-    results = list(validator.validate(hypothesis_text_dicts, verbose=True))
+    results = list(lm_inference.validate(hypothesis_text_dicts, verbose=True))
     print(results)
 
     prompts = [
@@ -175,4 +201,4 @@ if __name__ == "__main__":
         "My name is Jacob Steinhardt, I'm from ",
         "My name is Erik Jones, I'm from ",
     ]
-    print(validator.get_generation(prompts, 10))
+    print(lm_inference.get_generation(prompts, 10))

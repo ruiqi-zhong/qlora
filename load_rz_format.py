@@ -4,6 +4,7 @@ import os
 
 
 def load_from_path(path):
+    is_yes_no = True
     with open(path, "r") as f:
         key2promt_completions = json.load(f)
 
@@ -16,6 +17,11 @@ def load_from_path(path):
                     "output": prompt_completion["completion"],
                     "provenance": f"path={path}, key={key}, idx={idx}",
                 }
+                if (
+                    "yes" not in prompt_completion["completion"].lower()
+                    and "no" not in prompt_completion["completion"].lower()
+                ):
+                    is_yes_no = False
                 f.write(json.dumps(d) + "\n")
     f_dict = {
         "train": f"tmp_train.jsonl",
@@ -24,7 +30,16 @@ def load_from_path(path):
     dataset = load_dataset("json", data_files=f_dict)
     for f in f_dict.values():
         os.remove(f)
-    return dataset
+    return_dict = {
+        "dataset": dataset,
+        "is_yes_no": is_yes_no,
+        "key2promt_completions": key2promt_completions,
+    }
+    if is_yes_no:
+        return_dict["test_labels"] = [
+            "yes" in d["completion"].lower() for d in key2promt_completions["eval"]
+        ]
+    return return_dict
 
 
 if __name__ == "__main__":

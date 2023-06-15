@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 import sys
 from typing import Optional, Dict, Sequence
 import numpy as np
-from tqdm import tqdm
+from tqdm import tqdm, trange
 import logging
 import bitsandbytes as bnb
 import pandas as pd
@@ -168,6 +168,12 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
             "help": "The training batch size per GPU. Increase for better speed."
         },
     )
+    per_device_eval_batch_size: int = field(
+        default=8,
+        metadata={
+            "help": "The training batch size per GPU. Increase for better speed."
+        },
+    )
     gradient_accumulation_steps: int = field(
         default=16,
         metadata={
@@ -227,6 +233,12 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
         metadata={
             "help": "How many checkpoints to save before the oldest is overwritten"
         },
+    )
+    evaluation_strategy: str = field(
+        default="no", metadata={"help": "When to evaluate the model"}
+    )
+    eval_steps: int = field(
+        default=250, metadata={"help": "How often to evaluate the model"}
     )
 
 
@@ -680,12 +692,13 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
     # Load dataset.
     # dataset = load_data(args.dataset)
     # dataset = format_dataset(dataset, args.dataset_format)
-    dataset = load_from_path(args.dataset)
+    dataset_dict = load_from_path(args.dataset)
+    dataset = dataset_dict["dataset"]
 
     # Split train/eval, reduce size
     if args.do_eval or args.do_predict:
-        if "eval" in dataset:
-            eval_dataset = dataset["eval"]
+        if "test" in dataset:
+            eval_dataset = dataset["test"]
         else:
             print(
                 "Splitting train dataset in train and validation according to `eval_dataset_size`"
@@ -722,12 +735,16 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
         train_on_source=args.train_on_source,
         predict_with_generate=args.predict_with_generate,
     )
-    return dict(
-        train_dataset=train_dataset if args.do_train else None,
-        eval_dataset=eval_dataset if args.do_eval else None,
-        predict_dataset=eval_dataset if args.do_predict else None,
-        data_collator=data_collator,
-    )
+    return_dict = {
+        "data_module": dict(
+            train_dataset=train_dataset if args.do_train else None,
+            eval_dataset=eval_dataset if args.do_eval else None,
+            predict_dataset=eval_dataset if args.do_predict else None,
+            data_collator=data_collator,
+        ),
+        "dataset_dict": dataset_dict,
+    }
+    return return_dict
 
 
 def get_last_checkpoint(checkpoint_dir):
@@ -747,6 +764,46 @@ def get_last_checkpoint(checkpoint_dir):
         print(f"Found a previous checkpoint at: {checkpoint_dir}")
         return checkpoint_dir, is_completed  # checkpoint found!
     return None, False  # first training
+
+
+def generate_with_model_tokenizer_prompt_single_batch(
+    model_tokenizer, prompts, **kwargs
+):
+    model, tokenizer = model_tokenizer
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True).to("cuda:0")
+    outputs = model.generate(
+        **inputs,
+        return_dict_in_generate=True,
+        **kwargs,
+    )
+    output_sequences = outputs["sequences"]
+    input_lengths = [len(tokenizer.encode(p)) for p in prompts]
+    returned_strings = [
+        tokenizer.decode(
+            output_sequences[i][input_lengths[i] :],
+            skip_special_tokens=True,
+        )
+        for i in range(len(prompts))
+    ]
+    return returned_strings
+
+
+def generate_with_model_tokenizer_prompt(
+    model_tokenizer, prompts, batch_size, **kwargs
+):
+    model_tokenizer[0].eval()
+
+    results = []
+    for i in trange(0, len(prompts), batch_size):
+        batch = prompts[i : i + batch_size]
+        results.extend(
+            generate_with_model_tokenizer_prompt_single_batch(
+                model_tokenizer, batch, **kwargs
+            )
+        )
+
+    model_tokenizer[0].train()
+    return results
 
 
 def train():
@@ -818,13 +875,25 @@ def train():
                 ),
             }
         )
-    data_module = make_data_module(tokenizer=tokenizer, args=args)
+    data_module_dict = make_data_module(tokenizer=tokenizer, args=args)
+    data_module = data_module_dict["data_module"]
     trainer = Seq2SeqTrainer(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
         **{k: v for k, v in data_module.items() if k != "predict_dataset"},
     )
+    eval_prompts = [
+        x["prompt"]
+        for x in data_module_dict["dataset_dict"]["key2promt_completions"]["eval"]
+    ]
+
+    # results = generate_with_model_tokenizer_prompt(
+    #     (model, tokenizer),
+    #     eval_prompts,
+    #     batch_size=training_args.eval_batch_size,
+    #     **vars(generation_args),
+    # )
 
     # Callbacks
     if not args.full_finetune:
@@ -905,6 +974,37 @@ def train():
 
         trainer.add_callback(MMLUEvalCallback)
 
+    if args.do_eval:
+
+        class EvalCallback(transformers.TrainerCallback):
+            def on_save(self, args, state, control, model, **kwargs):
+                save_path = os.path.join(
+                    args.output_dir, f"eval_{state.global_step}_generation.json"
+                )
+                predictions = generate_with_model_tokenizer_prompt(
+                    (model, tokenizer),
+                    eval_prompts,
+                    max_new_tokens=generation_args.max_new_tokens,
+                    temperature=generation_args.temperature,
+                    batch_size=training_args.per_device_eval_batch_size,
+                )
+
+                if data_module_dict["dataset_dict"]["is_yes_no"]:
+                    predicted_bools = np.array(
+                        ["yes" in p.lower() for p in predictions]
+                    )
+                    gold_bools = np.array(
+                        data_module_dict["dataset_dict"]["test_labels"]
+                    )
+                    accuracy = np.mean(predicted_bools == gold_bools)
+                    print(f"Step {state.global_step} Accuracy: {accuracy}")
+
+                # Save predictions
+                with open(save_path, "w") as f:
+                    json.dump(predictions, f)
+
+        trainer.add_callback(EvalCallback)
+
     # Verifying the datatypes.
     dtypes = {}
     for _, p in model.named_parameters():
@@ -947,12 +1047,9 @@ def train():
             )
             prediction_metrics = prediction_output.metrics
             predictions = prediction_output.predictions
-            print(predictions.shape)
-            print(predictions[0][0].shape)
             predictions = np.where(
                 predictions != -100, predictions, tokenizer.pad_token_id
             )
-            print(predictions)
             predictions = tokenizer.batch_decode(
                 predictions, skip_special_tokens=True, clean_up_tokenization_spaces=True
             )
